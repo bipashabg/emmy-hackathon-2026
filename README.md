@@ -8,6 +8,58 @@ pipeline — Emmy's autotuner compiles thousands of kernel variants, so that mid
 You do **not** need a GPU. A hosted runner at `http://runner.riftstack.ai:48701` (the default in `submit.py`) compiles
 your PTX with `ptxas`, executes it on real hardware, and tells you whether the output is correct. See [docs/API.md](docs/API.md).
 
+## My Implementation
+
+This repository contains my implementation for the Emmy Hackathon 2026 challenge: compiling Emmy Kernel IR directly to NVIDIA PTX.
+
+### Current progress
+
+The compiler infrastructure is being developed incrementally, starting with the pointwise category.
+
+- **PTX builder:** Generates PTX kernel structure, register declarations, labels, and instructions.
+- **Kernel IR loading:** Uses Emmy's IR classes to inspect kernel operations and their bodies.
+- **Tile lowering:** Implements initial handling for single-axis tiles, including thread-index setup and bounds checks.
+- **Index-expression lowering:** Supports variables, integer literals, and basic integer arithmetic (`+`, `-`, and `*`).
+
+The current implementation is a work in progress. Full statement lowering and end-to-end correctness still need to be validated before claiming support for a problem category.
+
+### Development setup
+
+Python 3.12 or newer is required. Install the dependencies specified by the challenge:
+
+```bash
+pip install emmy-ml==0.3.11 numpy requests
+```
+
+Run the compiler using the required command-line interface:
+
+```bash
+python compile.py problems/p00_scalar_add/k_add_pointwise.ir.json > out.ptx
+```
+
+Validate generated PTX syntax with `ptxas` (when available):
+
+```bash
+ptxas -arch=sm_89 out.ptx -o /dev/null
+```
+
+Run the project's current development tests with:
+
+```bash
+python -m tools.test_tile
+python -m tools.test_expr
+```
+
+These development tests exercise individual lowering components; they do not, by themselves, establish end-to-end kernel correctness. Use the hackathon submission runner to validate a complete kernel once the compiler supports it:
+
+```bash
+python submit.py p00_scalar_add --compiler ./compile.py
+```
+
+### Implementation scope
+
+The compiler is being built incrementally, with correctness and explicit handling of unsupported IR constructs prioritized over claiming broad support prematurely. Future work includes lowering memory operations and elementwise statements, validating generated kernels on the hosted runner, and expanding support to additional categories.
+
 ## Requirements
 
 - **Python 3.12 or newer.** The Kernel IR only deserializes through Emmy's own classes:
