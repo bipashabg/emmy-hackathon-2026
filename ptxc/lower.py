@@ -30,6 +30,7 @@ class LowerContext:
         self.ptr_env = {}
         self.acc_env = {}
         self.smem_env = {}
+        self.shape_env = {}
         self.tid_reg = None
         self._lane_reg = None
         self._warp_reg = None
@@ -48,6 +49,9 @@ def lower_kernel(kernel, kspec):
     entry = kspec["entry"]
     arg_order = kspec["arg_order"]
 
+    for arg in kspec["args"]:
+        ctx.shape_env[arg["name"]] = tuple(arg["shape"])
+
     for name in arg_order:
         raw = b.reg("u64")
         b.emit(f"ld.param.u64 {raw}, [param_{name}];")
@@ -63,38 +67,49 @@ def lower_kernel(kernel, kspec):
     return b.render_kernel(entry, arg_order)
 
 
+def _guard(reg, extent, done_label, ctx):
+    b = ctx.b
+    pred = b.reg("pred")
+    b.emit(f"setp.ge.s32 {pred}, {reg}, {extent};")
+    b.emit(f"bra {done_label};", pred=pred)
+
+
 def lower_tile(tile, ctx):
     b = ctx.b
-
-    if len(tile.axes) != 1:
-        raise NotImplementedError(
-            f"lower_tile handles one axis for now; got {len(tile.axes)}"
-        )
-
     ctx._lane_reg = None
     ctx._warp_reg = None
 
-    axis = tile.axes[0]
-    extent = extent_to_int(axis)
+    axes = tile.axes
 
     tid = b.reg("s32")
     b.emit(f"mov.u32 {tid}, {b.sreg('tid.x')};")
     ctx.tid_reg = tid
-    ntid = b.reg("s32")
-    b.emit(f"mov.u32 {ntid}, {b.sreg('ntid.x')};")
-    ctaid = b.reg("s32")
-    b.emit(f"mov.u32 {ctaid}, {b.sreg('ctaid.x')};")
-
-    idx = b.reg("s32")
-    b.emit(f"mad.lo.s32 {idx}, {ctaid}, {ntid}, {tid};")
-
-    pred = b.reg("pred")
-    b.emit(f"setp.ge.s32 {pred}, {idx}, {extent};")
 
     done = ctx.fresh_label("DONE")
-    b.emit(f"bra {done};", pred=pred)
 
-    ctx.axis_env[axis.name] = idx
+    if len(axes) == 1:
+        ntid = b.reg("s32")
+        b.emit(f"mov.u32 {ntid}, {b.sreg('ntid.x')};")
+        ctaid = b.reg("s32")
+        b.emit(f"mov.u32 {ctaid}, {b.sreg('ctaid.x')};")
+        idx = b.reg("s32")
+        b.emit(f"mad.lo.s32 {idx}, {ctaid}, {ntid}, {tid};")
+        ctx.axis_env[axes[0].name] = idx
+        _guard(idx, extent_to_int(axes[0]), done, ctx)
+
+    elif len(axes) == 2:
+        outer, inner = axes[0], axes[1]
+        ctaid = b.reg("s32")
+        b.emit(f"mov.u32 {ctaid}, {b.sreg('ctaid.x')};")
+        ctx.axis_env[inner.name] = tid       # thread within block
+        ctx.axis_env[outer.name] = ctaid     # block index
+        _guard(tid, extent_to_int(inner), done, ctx)
+        _guard(ctaid, extent_to_int(outer), done, ctx)
+
+    else:
+        raise NotImplementedError(
+            f"lower_tile handles 1 or 2 axes; got {len(axes)}"
+        )
 
     for stmt in tile.body:
         lower_stmt(stmt, ctx)
@@ -164,7 +179,6 @@ def _value_reg(name, ctx):
     )
 
 
-
 _INT_BINOP = {
     "*": "mul.lo.s32",  "mul": "mul.lo.s32",
     "+": "add.s32",     "add": "add.s32",
@@ -204,7 +218,6 @@ def lower_expr(expr, ctx):
     )
 
 
-
 _DTYPE = {
     "f32": ("f32", 4),
     "f64": ("f64", 8),
@@ -222,18 +235,49 @@ def _dtype_key(dt):
     return getattr(dt, "name", str(dt)).lower()
 
 
-def _resolve_index(index_tuple, ctx, what):
-    if len(index_tuple) != 1:
+def _linear_index(index_exprs, shape, ctx):
+    b = ctx.b
+    n = len(index_exprs)
+    if len(shape) != n:
         raise NotImplementedError(
-            f"multi-dimensional {what} index not supported yet: "
-            f"{len(index_tuple)} dims"
+            f"index rank {n} != tensor rank {len(shape)} (shape={shape})"
         )
-    index = lower_expr(index_tuple[0], ctx)
-    if isinstance(index, int):
-        idx_reg = ctx.b.reg("s32")
-        ctx.b.emit(f"mov.s32 {idx_reg}, {index};")
-        index = idx_reg
-    return index
+
+    strides = [1] * n
+    for k in range(n - 2, -1, -1):
+        strides[k] = strides[k + 1] * shape[k + 1]
+
+    acc = None
+    for e, s in zip(index_exprs, strides):
+        operand = lower_expr(e, ctx)
+        if isinstance(operand, int):
+            term = operand * s
+        elif s == 1:
+            term = operand
+        else:
+            r = b.reg("s32")
+            b.emit(f"mul.lo.s32 {r}, {operand}, {s};")
+            term = r
+
+        if acc is None:
+            acc = term
+        elif isinstance(acc, int) and isinstance(term, int):
+            acc = acc + term
+        else:
+            r = b.reg("s32")
+            b.emit(f"add.s32 {r}, {acc}, {term};")
+            acc = r
+
+    return acc
+
+
+def _index_reg(index_exprs, shape, ctx):
+    idx = _linear_index(index_exprs, shape, ctx)
+    if isinstance(idx, int):
+        r = ctx.b.reg("s32")
+        ctx.b.emit(f"mov.s32 {r}, {idx};")
+        idx = r
+    return idx
 
 
 def _byte_address(base, index, elem_size, ctx):
@@ -269,7 +313,8 @@ def lower_load(stmt, ctx):
             f"bound tensors are {sorted(ctx.ptr_env)}"
         )
 
-    index = _resolve_index(stmt.index, ctx, "load")
+    shape = ctx.shape_env[stmt.input]
+    index = _index_reg(stmt.index, shape, ctx)
     addr = _byte_address(base, index, elem_size, ctx)
 
     dst = b.reg(ptx_ty)
@@ -323,7 +368,8 @@ def lower_write(stmt, ctx):
         if len(stmt.index) == 0:
             addr = base
         else:
-            index = _resolve_index(stmt.index, ctx, "write")
+            shape = ctx.shape_env[out]
+            index = _index_reg(stmt.index, shape, ctx)
             addr = _byte_address(base, index, elem_size, ctx)
 
     else:
@@ -407,9 +453,7 @@ def lower_assign(stmt, ctx):
     ptx_ty, _ = _DTYPE[key]
 
     op_name = str(getattr(stmt.op, "name", stmt.op)).lower()
-
     srcs = [_value_reg(a, ctx) for a in stmt.args]
-
     dst = b.reg(ptx_ty)
 
     binop = _FLOAT_BINOP.get(op_name)
@@ -547,7 +591,6 @@ def lower_cond(stmt, ctx):
 
     if type(cond).__name__ != "BinaryExpr" or cond.op not in _CMP_NEG:
         raise NotImplementedError(f"unsupported Cond condition {cond!r}")
-
     if stmt.else_body:
         raise NotImplementedError("Cond else_body not supported yet")
 
